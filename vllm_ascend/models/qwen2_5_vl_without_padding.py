@@ -19,10 +19,12 @@
 from functools import partial
 from typing import Callable, Optional
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch_npu
+import torch.distributed as dist
 from einops import rearrange
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLConfig, Qwen2_5_VLVisionConfig)
@@ -40,6 +42,7 @@ from vllm.distributed import utils as dist_utils
 from vllm.model_executor.layers.activation import (_ACTIVATION_REGISTRY,
                                                    get_act_and_mul_fn)
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.linear import (ColumnParallelLinear, ReplicatedLinear, RowParallelLinear)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.qwen2_5_vl import (
     Qwen2_5_VisionAttention, Qwen2_5_VisionBlock, Qwen2_5_VisionPatchEmbed,
@@ -50,7 +53,7 @@ from vllm.model_executor.models.qwen2_5_vl import (
 try:
     from vllm.model_executor.models.qwen3_vl import (
         Qwen3_VisionBlock, Qwen3_VisionPatchEmbed, Qwen3_VisionTransformer,
-        Qwen3_VisionPatchMerger,
+        Qwen3_VisionPatchMerger, Qwen3_VisionMLP,
         Qwen3VLDummyInputsBuilder, Qwen3VLForConditionalGeneration,
         Qwen3VLMultiModalProcessor, Qwen3VLProcessingInfo)
     from vllm.model_executor.models.qwen3_vl_moe import (
@@ -110,7 +113,17 @@ class AscendQwen2_5_VisionAttention_Without_Padding(Qwen2_5_VisionAttention):
                                      output_size=embed_dim,
                                      quant_config=quant_config,
                                      prefix=f"{prefix}.proj")
-
+    
+    def split_qkv(self, qkv: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        # [s, b, 3 * head * head_dim]
+        seq_len, bs, _ = qkv.shape
+        # [s, b, 3 * head * head_dim] -> 3 * [s, b, head * head_dim]
+        q, k, v = qkv.chunk(3, dim=2)
+        # 3 * [s, b, head * head_dim] -> 3 * [s, b, head, head_dim]
+        new_shape = (seq_len, bs, self.num_attention_heads_per_partition,
+                     self.hidden_size_per_attention_head)
+        q, k, v = (x.view(*new_shape) for x in (q, k, v))
+        return q, k, v
 
     def forward(
         self,
@@ -435,16 +448,18 @@ class AscendQwen3_VisionBlock(Qwen3_VisionBlock):
         return x
 
 class AscendQwen3_VisionPatchMerger(Qwen3_VisionPatchMerger):
-        def __init__(
+    def __init__(
         self,
         d_model: int,
         context_dim: int,
         norm_layer: Optional[Callable[[int], nn.Module]] = None,
         spatial_merge_size: int = 2,
+        use_postshuffle_norm: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        use_data_parallel: bool = False,
     ) -> None:
-        super().__init__()
+        super().__init__(d_model, context_dim, norm_layer, spatial_merge_size, prefix, use_data_parallel)
         self.hidden_size = context_dim * (spatial_merge_size**2)
 
         self.use_postshuffle_norm = use_postshuffle_norm
@@ -544,6 +559,7 @@ class AscendQwen3_VisionTransformer(Qwen3_VisionTransformer):
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
         hidden_states = hidden_states.unsqueeze(1)
+        seq_len, _, _ = hidden_states.size()
         rotary_pos_emb = rotary_pos_emb.to(hidden_states.device)
         #pad for sp:
         rank, world_size = get_rank_world()
@@ -564,7 +580,8 @@ class AscendQwen3_VisionTransformer(Qwen3_VisionTransformer):
             hidden_states = blk(hidden_states,
                                 cu_seqlens=cu_seqlens,
                                 cos=cos,
-                                sin=sin)
+                                sin=sin,
+                                true_seq=seq_len)
             if layer_num in self.deepstack_visual_indexes:
                 deepstack_merger_idx = self.deepstack_visual_indexes.index(
                     layer_num)
@@ -711,14 +728,15 @@ class AscendQwen3VLMoeForConditionalGeneration(
         )
 
 class AscendQwen3_VisionMLP(Qwen3_VisionMLP):
-        def __init__(self,
+    def __init__(self,
                  in_features: int,
                  hidden_features: int,
                  bias: bool = False,
                  act_fn: Callable[[torch.Tensor], torch.Tensor] = F.silu,
                  quant_config: Optional[QuantizationConfig] = None,
-                 prefix: str = ""):
-        super().__init__()
+                 prefix: str = "",
+                 use_data_parallel: bool = False):
+        super().__init__(in_features, hidden_features, bias, act_fn, quant_config, prefix, use_data_parallel)
         self.linear_fc1 = ColumnParallelLinear(
             in_features,
             hidden_features,

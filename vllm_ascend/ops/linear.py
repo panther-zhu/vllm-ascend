@@ -77,7 +77,8 @@ class AscendLinearBase(LinearBase):
         self.params_dtype = params_dtype
         self.quant_config = quant_config
         self.prefix = prefix
-        if quant_config is None:
+
+        if quant_config is None or quant_config is False:
             self.quant_method: Optional[
                 QuantizeMethodBase] = AscendUnquantizedLinearMethod()
         else:
