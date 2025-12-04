@@ -151,7 +151,7 @@ def _maybe_all_gather_and_maybe_unpad_fake(
     if forward_context.is_multimodal_model and is_first_allgather:
         return x
 
-    if get_forward_context.sp_enabled and label:
+    if forward_context.sp_enabled and label:
         return torch.empty(
             (x.shape[0] * get_tensor_model_parallel_world_size(),
              *x.shape[1:]),
