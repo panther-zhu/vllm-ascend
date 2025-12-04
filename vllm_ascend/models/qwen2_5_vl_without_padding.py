@@ -42,7 +42,7 @@ from vllm.distributed import utils as dist_utils
 from vllm.model_executor.layers.activation import (_ACTIVATION_REGISTRY,
                                                    get_act_and_mul_fn)
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import (ColumnParallelLinear, ReplicatedLinear, RowParallelLinear)
+from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.qwen2_5_vl import (
     Qwen2_5_VisionAttention, Qwen2_5_VisionBlock, Qwen2_5_VisionPatchEmbed,
@@ -53,7 +53,7 @@ from vllm.model_executor.models.qwen2_5_vl import (
 try:
     from vllm.model_executor.models.qwen3_vl import (
         Qwen3_VisionBlock, Qwen3_VisionPatchEmbed, Qwen3_VisionTransformer,
-        Qwen3_VisionPatchMerger, Qwen3_VisionMLP,
+        Qwen3_VisionPatchMerger,Qwen3_VisionMLP,
         Qwen3VLDummyInputsBuilder, Qwen3VLForConditionalGeneration,
         Qwen3VLMultiModalProcessor, Qwen3VLProcessingInfo)
     from vllm.model_executor.models.qwen3_vl_moe import (
@@ -81,6 +81,45 @@ def get_rank_world():
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     return rank, world_size
+
+class AscendQwen3_VisionMLP(Qwen3_VisionMLP):
+    def __init__(self,
+             in_features: int,
+             hidden_features: int,
+             bias: bool = False,
+             act_fn: Callable[[torch.Tensor], torch.Tensor] = F.silu,
+             quant_config: Optional[QuantizationConfig] = None,
+             prefix: str = ""):
+        super().__init__(in_features, hidden_features, bias, act_fn,
+                         quant_config, prefix)
+        self.linear_fc1 = ReplicatedLinear(
+            in_features,
+            hidden_features,
+            bias=bias,
+            quant_config=quant_config,
+            return_bias=False,
+            prefix=f"{prefix}.linear_fc1"
+        )
+        self.linear_fc2 = ReplicatedLinear(
+            hidden_features,
+            in_features,
+            bias=bias,
+            quant_config=quant_config,
+            return_bias=False,
+            prefix=f"{prefix}.linear_fc2"
+        )
+        self.act_fn = act_fn
+        # self.activation = "gelu"
+
+    # def forward(self, x: torch.Tensor):
+    #     weight1 = self.linear_fc1.weight.T
+    #     weight2 = self.linear_fc2.weight.T
+        # print(f'{x.shape=}, {weight1.shape=}, {weight2.shape=}, {self.linear_fc1.custom_op.bias.shape=}, {self.linear_fc2.custom_op.bias.shape=}')
+    #     bias1 = self.linear_fc1.custom_op.bias.to(dtype=torch.float32)
+    #     bias2 = self.linear_fc2.custom_op.bias.to(dtype=torch.float32)
+    #     mlp_output = torch_npu.npu_ffn(x, weight1, weight2,self.activation, expert_tokens=None, expert_tokens_index=None, bias1=bias1, bias2=bias2)
+
+    #     return mlp_output
 
 class AscendQwen2_5_VisionAttention_Without_Padding(Qwen2_5_VisionAttention):
 
@@ -458,18 +497,10 @@ class AscendQwen3_VisionPatchMerger(Qwen3_VisionPatchMerger):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
-    ) -> None:
-        super().__init__(d_model, context_dim, norm_layer, spatial_merge_size, prefix, use_data_parallel)
-        self.hidden_size = context_dim * (spatial_merge_size**2)
-
-        self.use_postshuffle_norm = use_postshuffle_norm
-        if self.use_postshuffle_norm:
-            context_dim = self.hidden_size
-
-        if norm_layer is None:
-            norm_layer = partial(nn.LayerNorm, eps=1e-6)
-        self.norm = norm_layer(context_dim)
-        self.linear_fc1 = ColumnParallelLinear(
+        ) -> None:
+        super().__init__(d_model, context_dim, norm_layer, spatial_merge_size,use_postshuffle_norm,
+                         quant_config, prefix, use_data_parallel)
+        self.linear_fc1 = ReplicatedLinear(
             self.hidden_size,
             self.hidden_size,
             bias=True,
@@ -477,8 +508,7 @@ class AscendQwen3_VisionPatchMerger(Qwen3_VisionPatchMerger):
             prefix=f"{prefix}.linear_fc1",
             disable_tp=use_data_parallel,
         )
-        self.act_fn = nn.GELU()
-        self.linear_fc2 = RowParallelLinear(
+        self.linear_fc2 = ReplicatedLinear(
             self.hidden_size,
             d_model,
             bias=True,
@@ -524,6 +554,22 @@ class AscendQwen3_VisionTransformer(Qwen3_VisionTransformer):
             spatial_merge_size=self.spatial_merge_size,
             quant_config=quant_config,
             prefix=f"{prefix}.merger",
+            use_data_parallel = use_data_parallel,
+        )
+        self.deepstack_merger_list = nn.ModuleList(
+            [
+                AscendQwen3_VisionPatchMerger(
+                    d_model=vision_config.out_hidden_size,
+                    context_dim=self.hidden_size,
+                    spatial_merge_size=self.spatial_merge_size,
+                    use_postshuffle_norm=True,
+                    norm_layer=norm_layer,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.deepstack_merger_list.{layer_idx}",
+                    use_data_parallel=use_data_parallel,
+                )
+                for layer_idx in range(len(self.deepstack_visual_indexes))
+            ]
         )
         self.hidden_size_per_attention_head = dist_utils.divide(
             self.hidden_size, self.num_heads)
@@ -544,9 +590,8 @@ class AscendQwen3_VisionTransformer(Qwen3_VisionTransformer):
         x: torch.Tensor,
         grid_thw: list[list[int]],
     ) -> torch.Tensor:
-        hidden_states = x.to(device=self.device, dtype=self.dtype)
+        hidden_states = x.to(device=self.device, dtype=self.dtype, non_blocking = True)
         hidden_states = self.patch_embed(hidden_states)
-
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
         hidden_states = hidden_states + pos_embeds
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
@@ -558,8 +603,7 @@ class AscendQwen3_VisionTransformer(Qwen3_VisionTransformer):
             grid_thw_tensor[:, 0]).cpu().to(torch.int32)
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
-        hidden_states = hidden_states.unsqueeze(1)
-        seq_len, _, _ = hidden_states.size()
+        seq_len, _ = hidden_states.size()
         rotary_pos_emb = rotary_pos_emb.to(hidden_states.device)
         #pad for sp:
         rank, world_size = get_rank_world()
@@ -568,13 +612,15 @@ class AscendQwen3_VisionTransformer(Qwen3_VisionTransformer):
                                  ) * merge_size * world_size - seq_len
         if padding_size > 0:
             padding = torch.zeros(padding_size,
-                                  *x.size()[1:],
-                                  dtype=x.dtype,
-                                  device=x.device)
-            x = torch.cat([x, padding], dim=0)
-            
+                                  *hidden_states.size()[1:],
+                                  dtype=hidden_states.dtype,
+                                  device=hidden_states.device)
+            hidden_states = torch.cat([hidden_states, padding], dim=0)
+        
         cos, sin = self.cal_cos_sin(rotary_pos_emb)
-
+        
+        hidden_states = hidden_states.chunk(world_size, dim=0)[rank]
+        hidden_states = hidden_states.unsqueeze(1)
         deepstack_feature_lists = []
         for layer_num, blk in enumerate(self.blocks):
             hidden_states = blk(hidden_states,
@@ -592,6 +638,9 @@ class AscendQwen3_VisionTransformer(Qwen3_VisionTransformer):
         hidden_states = torch.cat(
             [hidden_states] + deepstack_feature_lists,
             dim=1)  # [seq_len, hidden_size * (1 + depth_of_deepstack)]
+        hidden_states = all_gather_2d(hidden_states, world_size=world_size, group=None)
+        if padding_size:
+            hidden_states = hidden_states[:-padding_size // merge_size]
         return hidden_states
 
 
@@ -727,32 +776,4 @@ class AscendQwen3VLMoeForConditionalGeneration(
             use_data_parallel=self.use_data_parallel,
         )
 
-class AscendQwen3_VisionMLP(Qwen3_VisionMLP):
-    def __init__(self,
-                 in_features: int,
-                 hidden_features: int,
-                 bias: bool = False,
-                 act_fn: Callable[[torch.Tensor], torch.Tensor] = F.silu,
-                 quant_config: Optional[QuantizationConfig] = None,
-                 prefix: str = "",
-                 use_data_parallel: bool = False):
-        super().__init__(in_features, hidden_features, bias, act_fn, quant_config, prefix, use_data_parallel)
-        self.linear_fc1 = ColumnParallelLinear(
-            in_features,
-            hidden_features,
-            bias=bias,
-            quant_config=quant_config,
-            return_bias=False,
-            prefix=f"{prefix}.linear_fc1",
-            disable_tp=use_data_parallel,
-        )
-        self.linear_fc2 = RowParallelLinear(
-            hidden_features,
-            in_features,
-            bias=bias,
-            quant_config=quant_config,
-            return_bias=False,
-            prefix=f"{prefix}.linear_fc2",
-            disable_tp=use_data_parallel,
-        )
-        self.act_fn = act_fn
+

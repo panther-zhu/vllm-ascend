@@ -2777,6 +2777,12 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                                             diagonal=1).to(torch.int8).to(
                                                 self.device)
 
+            assigned_mask_dim = 2048
+            self.fia_attn_mask = torch.triu(torch.ones(assigned_mask_dim,
+                                                       assigned_mask_dim),
+                                            diagonal=1).to(torch.int8).to(
+                                                self.device)
+
             num_computed_tokens_cpu = (
                 self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs])
 
