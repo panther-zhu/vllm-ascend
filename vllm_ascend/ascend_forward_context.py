@@ -73,7 +73,7 @@ def set_ascend_forward_context(
         prefetch_stream: torch.npu.Stream = None,
         model_instance: torch.nn.Module = None,
         weight_prefetch_method: Optional[WeightPrefetchMethod] = None,
-        is_mtp_model: bool = Flase,
+        is_mtp_model: bool = False,
         is_multimodal_model: bool = False):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
