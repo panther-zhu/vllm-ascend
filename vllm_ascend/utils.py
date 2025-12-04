@@ -21,6 +21,7 @@ import atexit
 import functools
 import math
 import os
+import re
 from contextlib import contextmanager, nullcontext
 from enum import Enum
 from threading import Lock
@@ -801,6 +802,15 @@ def weak_ref_tensors(
         return tuple(weak_ref_tensor(t) for t in tensors)
     raise ValueError("Invalid type for tensors")
 
+def parse_layer_idx(prefix: str) -> Optional[int]:
+    pattern = r'layers\.(\d+)'
+    match = re.search(pattern, prefix)
+    if match:
+        layer_idx = int(match.group(1))
+    else:
+        layer_idx = None
+
+    return layer_idx
 
 def npu_stream_switch(target_stream: torch.npu.Stream,
                       *,

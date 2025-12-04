@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 import torch_npu
 from vllm.distributed import (get_dp_group, get_ep_group,
+                              get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
                               tensor_model_parallel_all_gather,
                               tensor_model_parallel_all_reduce,
@@ -20,13 +21,36 @@ else:
     from vllm.utils.torch_utils import direct_register_custom_op
 
 
-def _maybe_all_gather_and_maybe_unpad_impl(
-        x: torch.Tensor,
-        label: bool,
-        is_ep_comm: bool = False) -> torch.Tensor:
+def _maybe_chunk_residual_impl(x: torch.Tensor,
+                               residual: torch.Tensor) -> torch.Tensor:
     try:
         forward_context = get_forward_context()
     except AssertionError:
+        return residual
+
+    if forward_context.is_multimodal_model and forward_context.sp_enabled and x.size(
+            0) != residual.size(0):
+        pad_size = forward_context.pad_size
+        if pad_size > 0:
+            residual = F.pad(residual, (0, 0, 0, pad_size))
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+        residual = torch.chunk(residual, tp_size, dim=0)[tp_rank]
+
+    return residual
+
+
+def _maybe_all_gather_and_maybe_unpad_impl(
+        x: torch.Tensor,
+        label: bool,
+        is_ep_comm: bool = False,
+        is_first_allgather: bool = None) -> torch.Tensor:
+    try:
+        forward_context = get_forward_context()
+    except AssertionError:
+        return x
+
+    if forward_context.is_multimodal_model and is_first_allgather:
         return x
 
     sp_enabled = forward_context.sp_enabled
@@ -121,9 +145,13 @@ def _maybe_prefetch_mlp_gate_up_proj_impl(x_dependency: torch.Tensor,
 def _maybe_all_gather_and_maybe_unpad_fake(
         x: torch.Tensor,
         label: bool,
-        is_ep_comm: bool = False) -> torch.Tensor:
+        is_ep_comm: bool = False,
+        is_first_allgather: bool = None) -> torch.Tensor:
+    forward_context = get_forward_context()
+    if forward_context.is_multimodal_model and is_first_allgather:
+        return x
 
-    if get_forward_context().sp_enabled and label:
+    if get_forward_context.sp_enabled and label:
         return torch.empty(
             (x.shape[0] * get_tensor_model_parallel_world_size(),
              *x.shape[1:]),
@@ -263,6 +291,11 @@ def _matmul_and_reduce_impl_fake(input_parallel: torch.Tensor,
 
     return output
 
+direct_register_custom_op(op_name="maybe_chunk_residual",
+                          op_func=_maybe_chunk_residual_impl,
+                          fake_impl=lambda x, residual: x,
+                          mutates_args=[],
+                          dispatch_key="PrivateUse1")
 
 direct_register_custom_op(op_name="maybe_all_gather_and_maybe_unpad",
                           op_func=_maybe_all_gather_and_maybe_unpad_impl,
