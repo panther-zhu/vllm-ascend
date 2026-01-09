@@ -501,9 +501,9 @@ class AscendMRotaryEmbedding(MRotaryEmbedding):
         query: torch.Tensor,
         key: torch.Tensor,
     ):
-        if self.mrope_section != [16, 24, 24] or \
-            get_ascend_device_type() == AscendDeviceType.A5:
-            return super().forward_oot(positions, query, key)
+        #if self.mrope_section != [16, 24, 24] or \
+        #    get_ascend_device_type() == AscendDeviceType.A5:
+        #    return super().forward_oot(positions, query, key)
 
         import torch_npu
         mrope_section = [0, 0, 0
