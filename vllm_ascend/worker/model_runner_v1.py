@@ -613,7 +613,7 @@ class NPUModelRunner(GPUModelRunner):
             # Add padding to the batch size.
             num_input_tokens = self.vllm_config.pad_for_cudagraph(
                 total_num_scheduled_tokens)
-        elif self.use_aclgraph and enable_sp(self.vllm_config):
+        elif enable_sp(self.vllm_config):
             # When using aclgraph, if total_num_scheduled_tokens exceeds the maximum graph size,
             # the model will fall back to running its FX graph in eager mode.
             # In this case, when sequence parallelism is enabled, we need to pad tokens to align
@@ -1438,7 +1438,8 @@ class NPUModelRunner(GPUModelRunner):
                     batch_descriptor=batch_descriptor,
                     num_actual_tokens=scheduler_output.
                     total_num_scheduled_tokens,
-                    model_instance=self.model):
+                    model_instance=self.model,
+                    is_multimodal_model=self.is_multimodal_model):
                 self.maybe_setup_kv_connector(scheduler_output)
 
                 hidden_states = self._generate_process_reqs_hidden_states(
@@ -1835,6 +1836,8 @@ class NPUModelRunner(GPUModelRunner):
             cu_num_tokens, arange = self._get_cumsum_and_arange(
                 num_scheduled_tokens)
 
+            num_reqs = len(cu_num_tokens)
+
             self.query_start_loc.cpu[1:num_reqs +
                                      1] = torch.Tensor(cu_num_tokens)
             self.query_lens = torch.from_numpy(num_scheduled_tokens)
@@ -1982,7 +1985,7 @@ class NPUModelRunner(GPUModelRunner):
         }
         # In multi-DP scenarios, there may be situations where all DP groups are executing dummy runs.
         # If sequence parallelism is enabled, it is essential to ensure that num_tokens is divisible by tp_size.
-        if self.use_aclgraph and enable_sp(self.vllm_config):
+        if enable_sp(self.vllm_config):
             tp_size = self.vllm_config.parallel_config.tensor_parallel_size
             num_tokens = math.ceil(num_tokens / tp_size) * tp_size
 
@@ -2148,7 +2151,8 @@ class NPUModelRunner(GPUModelRunner):
                     num_actual_tokens=0,
                     aclgraph_runtime_mode=aclgraph_runtime_mode,
                     batch_descriptor=batch_descriptor,
-                    model_instance=self.model):
+                    model_instance=self.model,
+                    is_multimodal_model=self.is_multimodal_model):
                 hidden_states = self._generate_dummy_run_hidden_states(
                     input_ids, positions, num_tokens_padded,
                     intermediate_tensors, inputs_embeds)
