@@ -475,7 +475,6 @@ class SequenceColumnParallelOp(CustomColumnParallelOp):
 
         input_ = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
             input_, True, is_first_allgather=self.is_first_allgather)
-        input_ = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(input_, True)
         output_parallel = self.quant_method.apply(self.layer, input_, bias)
 
         if self.gather_output:

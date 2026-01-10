@@ -1836,7 +1836,7 @@ class NPUModelRunner(GPUModelRunner):
             cu_num_tokens, arange = self._get_cumsum_and_arange(
                 num_scheduled_tokens)
 
-            num_reqs = len(cu_num_tokens)
+            #num_reqs = len(cu_num_tokens)
 
             self.query_start_loc.cpu[1:num_reqs +
                                      1] = torch.Tensor(cu_num_tokens)
