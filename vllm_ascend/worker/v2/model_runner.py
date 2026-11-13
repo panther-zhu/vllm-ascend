@@ -56,11 +56,15 @@ from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import (
     MoECommType,
+    _is_a2_megamoe_enabled,
     get_mc2_tokens_capacity,
+    get_mrv2_num_actual_tokens,
     override_mrv2_in_profile_run,
+    override_mrv2_num_actual_tokens,
     select_moe_comm_method,
     set_mc2_mask,
     set_mc2_tokens_capacity,
+    use_cann_megamoe,
 )
 from vllm_ascend.attention.attention_c8_mxfp import (
     AscendC8MXFPAttentionBackendImpl,
@@ -740,8 +744,29 @@ class NPUModelRunner(GPUModelRunner):
             skip_dp_coordination() if should_skip_allreduce_across_dp_group(self.vllm_config) else nullcontext()
         )
         profile_kwargs = {"randomize_inputs": randomize_inputs}
+        # The V2 forward-context hook sees the graph-padded token count. Keep
+        # the scheduler's logical count so MegaMoe can mask padded rows. An
+        # enclosing context (the idle-DP dummy path) may explicitly override it.
+        actual_num_tokens = get_mrv2_num_actual_tokens()
+        if actual_num_tokens is not None or getattr(
+            scheduler_output, "total_num_scheduled_tokens", None
+        ) is None:
+            actual_tokens_context = nullcontext()
+        else:
+            actual_tokens_context = override_mrv2_num_actual_tokens(
+                scheduler_output.total_num_scheduled_tokens
+            )
+        # MRv2 sets ForwardContext inside upstream execute_model, so the
+        # per-forward skip_compiled flag used by V1 is not available here.
+        # Bypass the compiled model for eligible A2 MegaMoe models while
+        # retaining the runner's configured ACL graph dispatch.
+        megamoe_compile_context = (
+            disable_compilation(self.get_model())
+            if _is_a2_megamoe_enabled(self.ascend_config) and use_cann_megamoe(self.vllm_config)
+            else nullcontext()
+        )
         forward_failed = True
-        with dp_coordination_context:
+        with actual_tokens_context, megamoe_compile_context, dp_coordination_context:
             try:
                 output = super().execute_model(
                     scheduler_output,
@@ -758,6 +783,16 @@ class NPUModelRunner(GPUModelRunner):
                 finish_execution = getattr(self.model_state, "finish_execution", None)
                 if finish_execution is not None:
                     finish_execution(failed=forward_failed)
+        if (
+            not dummy_run
+            and not is_profile
+            and getattr(scheduler_output, "total_num_scheduled_tokens", None) == 0
+            and self.parallel_config.distributed_executor_backend == "external_launcher"
+            and self.parallel_config.data_parallel_size > 1
+        ):
+            # Upstream MRv2 returns before the model forward on a locally idle
+            # DP rank. Join the other ranks' MoE collectives with a masked row.
+            self._run_empty_dp_dummy_forward()
         if not dummy_run and not is_profile:
             self._maybe_send_draft_kv(scheduler_output)
         self.model_state.kvpp_is_dummy_run = False
@@ -805,6 +840,22 @@ class NPUModelRunner(GPUModelRunner):
                 input_batch=replace(state.input_batch, num_reqs=len(scheduler_output.num_scheduled_tokens))
             )
         return output
+
+    @contextmanager
+    def _bypass_runtime_guard_for_idle_dummy(self):
+        runtime_guard = getattr(self, "runtime_guard", None)
+        if runtime_guard is None:
+            yield
+            return
+        self.runtime_guard = None
+        try:
+            yield
+        finally:
+            self.runtime_guard = runtime_guard
+
+    def _run_empty_dp_dummy_forward(self) -> None:
+        with override_mrv2_num_actual_tokens(0), self._bypass_runtime_guard_for_idle_dummy():
+            self._dummy_run(1, is_idle_dp_dummy=True)
 
     def _maybe_send_draft_kv(self, scheduler_output: SchedulerOutput) -> None:
         """Write draft KV on P, then let D pull the exact allocated cache pages."""
@@ -1303,6 +1354,7 @@ class NPUModelRunner(GPUModelRunner):
         skip_eplb: bool = False,
         is_profile: bool = False,
         profile_cpp: bool = False,
+        is_idle_dp_dummy: bool = False,
         **kwargs,
     ):
         """Balanced dummy routing for adaptive-verification profiling; EPLB
@@ -1320,6 +1372,8 @@ class NPUModelRunner(GPUModelRunner):
                 "the profile-run marker, which makes XLite bypass its graph path."
             )
         load_balance_ctx = override_mrv2_in_profile_run(True) if profile_adaptive_tail else nullcontext()
+        actual_tokens_ctx = override_mrv2_num_actual_tokens(0) if is_idle_dp_dummy else nullcontext()
+        runtime_guard_ctx = self._bypass_runtime_guard_for_idle_dummy() if is_idle_dp_dummy else nullcontext()
         with (
             # Disable the CPP drafter before entering contexts that inspect it.
             self._cpp_profile_dummy(profile_cpp),
@@ -1327,6 +1381,8 @@ class NPUModelRunner(GPUModelRunner):
             self._preserve_dummy_query_tokens(num_tokens, uniform_decode),
             skip_ring_state_update(skip_ring),
             load_balance_ctx,
+            actual_tokens_ctx,
+            runtime_guard_ctx,
         ):
             output = super()._dummy_run(
                 num_tokens,

@@ -94,6 +94,17 @@ class TestMegaMoeLoading(unittest.TestCase):
             load_cann_mega_moe_ops()
         comm.CommContextManager._ensure_loaded.assert_called_once_with()
 
+    def test_loads_nested_cann_92_mega_moe_module(self):
+        ops = SimpleNamespace()
+        nested = SimpleNamespace(get_symm_buffer_for_mega_moe=object(), mega_moe=object())
+        comm = SimpleNamespace(comm_context_op_builder=MagicMock())
+        with patch(
+            "vllm_ascend.ops.fused_moe.moe_utils.import_module",
+            side_effect=[ops, nested, comm],
+        ):
+            self.assertEqual(load_cann_mega_moe_ops(), (nested.get_symm_buffer_for_mega_moe, nested.mega_moe))
+        comm.comm_context_op_builder.load.assert_called_once_with()
+
     def test_does_not_hide_missing_dependency(self):
         missing = ModuleNotFoundError(name="a_missing_cann_dependency")
         with (

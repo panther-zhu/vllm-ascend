@@ -29,7 +29,7 @@ from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 
 from vllm_ascend.config_utils import config
-from vllm_ascend.device.device_config import is_950
+from vllm_ascend.device.device_config import AscendDeviceType, get_ascend_device_type, is_950
 from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily, HardwareCapability, get_current_hardware_profile
 
 if TYPE_CHECKING:
@@ -440,6 +440,8 @@ class AscendConfig:
             "mix_placement": false,
             "pa_shape_list": [],
             "mega_moe_max_tokens": 65536,
+            "mega_moe_min_tokens": 512,
+            "dp_allreduce_on_npu": false,
             "ascend_log_path": "~/ascend/log/vllm_ascend",
             "enable_fused_mc2": 0,
             "enable_mlapo": true,
@@ -600,6 +602,8 @@ class AscendConfig:
     # degradation. Do not set it too large because workspace memory scales
     # linearly with this value. Default 65536.
     mega_moe_max_tokens: int = 65536
+    # Minimum batch size for the A2 CANN MegaMoe route.
+    mega_moe_min_tokens: int = 512
     ascend_log_path: str = dataclasses.field(
         default_factory=lambda: os.path.join(os.path.expanduser("~"), "ascend", "log", "vllm_ascend")
     )
@@ -612,6 +616,12 @@ class AscendConfig:
 
     # ---- A-family (envs fallback): default = envs module value, before-validator injects ----
     enable_fused_mc2: int = 0
+    # Preserve the user-selected mode after the legacy internal normalization
+    # of mode 2 to dispatch_ffn_combine's mode 1 representation.
+    fused_mc2_mode: int = dataclasses.field(default=0, init=False, repr=False)
+    # Use the NPU DP group for the metadata all-reduce when the CANN runtime
+    # does not provide a usable CPU HCCL group.
+    dp_allreduce_on_npu: bool = False
     enable_mlapo: bool = True
     # When True, keep MLAPO prefill weights on NPU instead of freeing them
     # on kv_consumer D nodes. Trades NPU memory for stability — D nodes have
@@ -671,6 +681,7 @@ class AscendConfig:
         # to enable the megamoe for testing capabilities.
         # These codes will be removed after megamoe is ready.
         global _MEGA_MOE_SUPPORTED
+        self.fused_mc2_mode = self.enable_fused_mc2
         if self.enable_fused_mc2 in (0, 1):
             # When enable_fused_mc2=1, roll back to dispatch_ffn_combine.
             _MEGA_MOE_SUPPORTED = False
@@ -816,6 +827,7 @@ class AscendConfig:
             )
         if self.enable_fused_mc2 == 1 and is_mega_moe_supported() and not self._is_megamoe_supported_by_config(vc):
             self.enable_fused_mc2 = 0
+            self.fused_mc2_mode = 0
             logger.warning_once(
                 "MegaMoe is not supported for this model config; additional_config.enable_fused_mc2 will be set to 0."
             )
@@ -912,6 +924,10 @@ class AscendConfig:
         # mega_moe_max_tokens range
         if self.mega_moe_max_tokens <= 0:
             raise ValueError(f"mega_moe_max_tokens must be a positive integer, got {self.mega_moe_max_tokens}")
+        if not isinstance(self.mega_moe_min_tokens, int) or not 1 <= self.mega_moe_min_tokens <= 4096:
+            raise ValueError(
+                f"mega_moe_min_tokens must be an integer in [1, 4096], got {self.mega_moe_min_tokens!r}"
+            )
 
         # batch-sharded sampling (Model Runner V2) shards the sampler inputs
         # per TP rank, while lmhead TP overrides NPUModelRunner.sample with a
@@ -1072,13 +1088,18 @@ class AscendConfig:
             moe_intermediate_size = getattr(hf_text_config, "intermediate_size", None)
         if moe_intermediate_size is None:
             return False
-        # intermediate_hidden (the post-activation intermediate width) must be in
-        # [256, 4096] and aligned to 128.
-        # Actual operator bounds: A5 supports [256, 4096] aligned to 128; the A3
-        # operator only supports [512, 3072] aligned to 256. The unified A5-style
-        # bound is kept here; tighten per-platform if A3 rejects a passing model.
         moe_intermediate_size = int(moe_intermediate_size)
-        if not (256 <= moe_intermediate_size <= 4096) or moe_intermediate_size % 128 != 0:
+        if get_ascend_device_type() == AscendDeviceType.A2:
+            # A2 CANN MegaMoe uses a wider expert matrix than the A3/A5 path.
+            if not (1024 <= moe_intermediate_size <= 8192) or moe_intermediate_size % 512 != 0:
+                logger.warning(
+                    "A2 MegaMoe requires moe_intermediate_size in [1024, 8192] aligned to 512; got %s.",
+                    moe_intermediate_size,
+                )
+                return False
+        # A3/A5 operators accept [256, 4096] aligned to 128. The A3 operator
+        # currently supports a narrower subset, which is validated at runtime.
+        elif not (256 <= moe_intermediate_size <= 4096) or moe_intermediate_size % 128 != 0:
             logger.warning(
                 "MegaMoe requires moe_intermediate_size in [256, 4096] aligned to 128; got %s.",
                 moe_intermediate_size,
@@ -1128,6 +1149,8 @@ class AscendConfig:
         if quant_type is None:
             return True
         quant_name = str(getattr(quant_type, "name", quant_type)).lower()
+        if get_ascend_device_type() == AscendDeviceType.A2:
+            return quant_name in {"w8a8", "w8a8_dynamic", "quanttype.w8a8"}
         supported_quant_names = {
             "w8a8",
             "w4a8",

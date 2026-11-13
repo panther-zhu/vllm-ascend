@@ -677,6 +677,7 @@ class NPUPlatform(Platform):
             _is_decode_only_node,
             get_mc2_mask,
             get_mrv2_in_profile_run,
+            get_mrv2_num_actual_tokens,
             select_moe_comm_method,
             sync_v2_extra_kwargs,
             use_cann_megamoe,
@@ -749,7 +750,11 @@ class NPUPlatform(Platform):
         mc2_mask = None
         padded_num_tokens = None
         if num_tokens is not None:
-            num_actual_tokens = num_tokens
+            # MRv2 supplies graph-padded ``num_tokens`` here. Preserve the
+            # real scheduled count for A2 MegaMoe's active-token mask.
+            num_actual_tokens = get_mrv2_num_actual_tokens()
+            if num_actual_tokens is None:
+                num_actual_tokens = num_tokens
             # NOTE: token num which need to pad to when mc2
             padded_num_tokens = math.ceil(max_tokens_across_dp / tp_world_size) * tp_world_size
             reserved_mc2_mask = get_mc2_mask()

@@ -14,7 +14,11 @@ from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 
 from tests.ut.base import TestBase
 from vllm_ascend.ascend_config import EplbConfig
-from vllm_ascend.ascend_forward_context import MoECommType, override_mrv2_in_profile_run
+from vllm_ascend.ascend_forward_context import (
+    MoECommType,
+    override_mrv2_in_profile_run,
+    override_mrv2_num_actual_tokens,
+)
 from vllm_ascend.device.hardware_profile import get_hardware_profile
 from vllm_ascend.platform import (
     NPUPlatform,
@@ -1229,6 +1233,34 @@ class TestNPUPlatform(TestBase):
             )
 
         self.assertTrue(kwargs["in_profile_run"])
+
+    def test_set_additional_forward_context_v2_masks_graph_padding(self):
+        vllm_config = TestNPUPlatform.mock_vllm_config()
+        vllm_config.use_v2_model_runner = True
+        reserved_mask = torch.zeros(8, dtype=torch.bool)
+
+        with (
+            patch("vllm_ascend.platform.envs_vllm.VLLM_USE_V2_MODEL_RUNNER", True, create=True),
+            patch("vllm_ascend.platform.is_moe_model", return_value=True),
+            patch("vllm_ascend.platform.enable_sp", return_value=False),
+            patch("vllm.distributed.get_tensor_model_parallel_world_size", return_value=4),
+            patch("vllm.distributed.get_dp_group", return_value=MagicMock(world_size=1)),
+            patch("vllm_ascend.ascend_forward_context.select_moe_comm_method", return_value=MoECommType.FUSED_MC2),
+            patch("vllm_ascend.ascend_forward_context.get_mc2_mask", return_value=reserved_mask),
+            patch("vllm_ascend.ascend_forward_context.use_cann_megamoe", return_value=True),
+            patch("vllm_ascend.ascend_forward_context._is_decode_only_node", return_value=False),
+            patch("vllm_ascend.ops.fused_moe.moe_comm_method.get_moe_comm_method", return_value=object()),
+            override_mrv2_num_actual_tokens(3),
+        ):
+            kwargs = self.platform.set_additional_forward_context(
+                attn_metadata=None,
+                vllm_config=vllm_config,
+                dp_metadata=None,
+                num_tokens=8,
+            )
+
+        assert kwargs["padded_num_tokens"] == 8
+        assert kwargs["mc2_mask"].tolist() == [True, True, True, False, False, False, False, False]
 
     @patch("vllm_ascend.quantization.utils.maybe_auto_detect_quantization")
     @patch("vllm_ascend.ascend_config.init_ascend_config")

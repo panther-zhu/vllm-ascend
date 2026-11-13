@@ -19,6 +19,9 @@ from vllm_ascend.device.hardware_profile import (
 from vllm_ascend.mrv2_utils import use_v2_model_runner
 from vllm_ascend.quantization.quant_type import A5_SUPPORT_MEGA_MOE_QUANT_TYPES, QuantType
 from vllm_ascend.utils import (
+    AscendDeviceType,
+    get_cann_megamoe_dummy_token_capacity,
+    get_ascend_device_type,
     has_layer_idx,
     is_moe_model,
 )
@@ -46,11 +49,87 @@ class MoECommType(Enum):
 
 
 _MRV2_IN_PROFILE_RUN: ContextVar[bool] = ContextVar("_MRV2_IN_PROFILE_RUN", default=False)
+_MRV2_NUM_ACTUAL_TOKENS: ContextVar[int | None] = ContextVar("_MRV2_NUM_ACTUAL_TOKENS", default=None)
 
 
 _MEGA_MOE_TOKENS_PER_RANK_LIMIT = 16384
 _DISPATCH_FFN_COMBINE_TOKENS_PER_RANK_LIMIT = 512
 _MC2_TOKENS_PER_RANK_LIMIT = 512
+_A2_CANN_MEGAMOE_TOKENS_PER_RANK_LIMIT = 4096
+_A2_CANN_MEGAMOE_SUPPORTED_EP_SIZES = frozenset({2, 4, 8, 16, 32})
+_A2_CANN_MEGAMOE_SUPPORTED_QUANT_NAMES = frozenset({"w8a8", "w8a8_dynamic", "quanttype.w8a8"})
+
+
+def _fused_mc2_mode(ascend_config: Any) -> int:
+    """Return the user-selected fused-MC2 mode.
+
+    ``AscendConfig`` keeps mode 2 normalized to mode 1 for compatibility with
+    the existing dispatch_ffn_combine callers.  Tests and lightweight config
+    objects may still expose the original value directly, so accept both forms.
+    """
+    return int(getattr(ascend_config, "fused_mc2_mode", getattr(ascend_config, "enable_fused_mc2", 0)))
+
+
+def _is_a2_megamoe_enabled(ascend_config: Any) -> bool:
+    return get_ascend_device_type() == AscendDeviceType.A2 and _fused_mc2_mode(ascend_config) == 2
+
+
+def _get_a2_megamoe_quant_name(vllm_config: VllmConfig, quant_type: Any) -> str | None:
+    if quant_type is not None:
+        return str(getattr(quant_type, "name", quant_type)).lower()
+    hf_text_config = vllm_config.model_config.hf_text_config
+    model_quant_type = getattr(hf_text_config, "moe_quantize", getattr(hf_text_config, "quantize", None))
+    if model_quant_type is not None:
+        return str(getattr(model_quant_type, "name", model_quant_type)).lower()
+    quant_config = getattr(vllm_config, "quant_config", None)
+    quant_description = getattr(quant_config, "quant_description", None)
+    if not isinstance(quant_description, dict):
+        return None
+    quant_values = {str(value).lower() for value in quant_description.values()}
+    return next((name for name in ("w8a8_dynamic", "w8a8") if name in quant_values), None)
+
+
+def _a2_cann_megamoe_supported_by_config(
+    vllm_config: VllmConfig,
+    quant_type: Any = None,
+    is_draft_model: bool = False,
+) -> bool:
+    ascend_config = get_ascend_config()
+    if (
+        is_draft_model
+        or not is_mega_moe_supported()
+        or not _is_a2_megamoe_enabled(ascend_config)
+        or getattr(getattr(ascend_config, "eplb_config", None), "dynamic_eplb", False)
+    ):
+        return False
+
+    ep_world_size = get_ep_group().world_size
+    if ep_world_size not in _A2_CANN_MEGAMOE_SUPPORTED_EP_SIZES:
+        return False
+
+    model_config = vllm_config.model_config
+    hf_text_config = model_config.hf_text_config
+    hidden_size = int(getattr(hf_text_config, "hidden_size", None) or model_config.get_hidden_size())
+    intermediate_hidden = getattr(hf_text_config, "moe_intermediate_size", None)
+    num_topk = getattr(hf_text_config, "num_experts_per_tok", getattr(hf_text_config, "top_k_experts", None))
+    if intermediate_hidden is None or num_topk is None:
+        return False
+    intermediate_hidden = int(intermediate_hidden)
+    num_topk = int(num_topk)
+    num_experts = int(model_config.get_num_experts())
+    if num_experts % ep_world_size != 0:
+        return False
+
+    quant_name = _get_a2_megamoe_quant_name(vllm_config, quant_type)
+    return (
+        1024 <= hidden_size <= 8192
+        and hidden_size % 512 == 0
+        and 1024 <= intermediate_hidden <= 8192
+        and intermediate_hidden % 512 == 0
+        and 1 <= num_topk <= 16
+        and 1 <= num_experts // ep_world_size <= 128
+        and quant_name in _A2_CANN_MEGAMOE_SUPPORTED_QUANT_NAMES
+    )
 
 
 def _is_decode_only_node(vllm_config: VllmConfig) -> bool:
@@ -98,12 +177,39 @@ def get_mrv2_in_profile_run() -> bool:
     return _MRV2_IN_PROFILE_RUN.get()
 
 
+@contextmanager
+def override_mrv2_num_actual_tokens(num_tokens: int):
+    """Override the logical token count while MRv2 builds its forward context.
+
+    MRv2 passes graph-padded token counts to ``set_forward_context``. A2
+    MegaMoe needs the active-token mask to distinguish scheduled tokens from
+    those graph-padding rows, including on idle DP ranks running a dummy step.
+    """
+    token = _MRV2_NUM_ACTUAL_TOKENS.set(num_tokens)
+    try:
+        yield
+    finally:
+        _MRV2_NUM_ACTUAL_TOKENS.reset(token)
+
+
+def get_mrv2_num_actual_tokens() -> int | None:
+    return _MRV2_NUM_ACTUAL_TOKENS.get()
+
+
 def use_cann_megamoe(vllm_config: VllmConfig) -> bool:
     # TODO: drop the EP-size guard when MegaMoe supports larger EP sizes.
+    ascend_config = get_ascend_config()
+    if _is_a2_megamoe_enabled(ascend_config):
+        return (
+            is_moe_model(vllm_config)
+            and vllm_config.parallel_config.enable_expert_parallel
+            and getattr(vllm_config, "lora_config", None) is None
+            and _a2_cann_megamoe_supported_by_config(vllm_config)
+        )
     return (
         is_mega_moe_supported()
         and get_current_hardware_profile().supports(HardwareCapability.CANN_MEGAMOE)
-        and get_ascend_config().enable_fused_mc2 == 1
+        and _fused_mc2_mode(ascend_config) in (1, 2)
         and is_moe_model(vllm_config)
         and vllm_config.parallel_config.enable_expert_parallel
         and 1 < get_ep_group().world_size <= 64
@@ -262,11 +368,12 @@ def set_mc2_tokens_capacity(vllm_config, max_num_reqs, uniform_decode_query_len)
 
     ascend_config = get_ascend_config()
     use_mega_moe = use_cann_megamoe(vllm_config)
+    a2_megamoe = _is_a2_megamoe_enabled(ascend_config)
 
     # Cap for fused MC2 / MegaMoe: regular MC2 (gated by enable_prefill_mc2) uses
     # HCCL comm buffer (HCCL_BUFFSIZE); MegaMoe (use_mega_moe, non-decode-only)
     # uses the symm buffer (separate torch alloc, not HCCL_BUFFSIZE).
-    if ascend_config.enable_prefill_mc2 or (use_mega_moe and not _is_decode_only_node(vllm_config)):
+    if a2_megamoe or ascend_config.enable_prefill_mc2 or (use_mega_moe and not _is_decode_only_node(vllm_config)):
         max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
     elif vllm_config.compilation_config.cudagraph_capture_sizes:
         max_num_tokens = vllm_config.compilation_config.max_cudagraph_capture_size
@@ -278,7 +385,20 @@ def set_mc2_tokens_capacity(vllm_config, max_num_reqs, uniform_decode_query_len)
     num_tokens_per_tp_rank = (max_num_tokens + tp_size - 1) // tp_size
     # keep the num_tokens_per_tp_rank less than fused_mc2 (mega_moe) tokens per rank limit
     if ascend_config.enable_fused_mc2:
-        if use_mega_moe:
+        if a2_megamoe and is_moe_model(vllm_config):
+            hf_text_config = vllm_config.model_config.hf_text_config
+            num_experts = int(vllm_config.model_config.get_num_experts())
+            num_topk = int(
+                getattr(hf_text_config, "num_experts_per_tok", getattr(hf_text_config, "top_k_experts", 1))
+            )
+            dummy_capacity = get_cann_megamoe_dummy_token_capacity(num_experts, num_topk)
+            num_tokens_per_tp_rank = min(
+                num_tokens_per_tp_rank,
+                _A2_CANN_MEGAMOE_TOKENS_PER_RANK_LIMIT - dummy_capacity,
+            )
+        elif a2_megamoe:
+            num_tokens_per_tp_rank = min(num_tokens_per_tp_rank, _A2_CANN_MEGAMOE_TOKENS_PER_RANK_LIMIT)
+        elif use_mega_moe:
             num_tokens_per_tp_rank = min(num_tokens_per_tp_rank, _MEGA_MOE_TOKENS_PER_RANK_LIMIT)
         else:
             num_tokens_per_tp_rank = min(num_tokens_per_tp_rank, _DISPATCH_FFN_COMBINE_TOKENS_PER_RANK_LIMIT)
@@ -307,6 +427,36 @@ def set_mc2_mask(vllm_config, device):
 
 def get_mc2_mask():
     return _reserved_mc2_mask
+
+
+def _select_a2_moe_comm_method(
+    num_tokens: int,
+    vllm_config: VllmConfig,
+    mc2_tokens_capacity: int,
+    quant_type: Any = None,
+    is_draft_model: bool = False,
+) -> MoECommType:
+    """Select A2 MegaMoe when its shape and token constraints are satisfied."""
+    min_tokens = getattr(get_ascend_config(), "mega_moe_min_tokens", 512)
+    if (
+        num_tokens is not None
+        and min_tokens <= num_tokens <= mc2_tokens_capacity
+        and _a2_cann_megamoe_supported_by_config(vllm_config, quant_type, is_draft_model)
+    ):
+        return MoECommType.FUSED_MC2
+
+    num_experts = int(vllm_config.model_config.get_num_experts())
+    ep_world_size = (
+        vllm_config.parallel_config.world_size_across_dp // vllm_config.parallel_config.pipeline_parallel_size
+    )
+    num_experts_per_device = num_experts // ep_world_size
+    if num_experts > 512:
+        return MoECommType.ALLGATHER
+    if num_experts_per_device <= 24 and ep_world_size >= 16 and (
+        num_tokens is None or num_tokens <= mc2_tokens_capacity
+    ):
+        return MoECommType.MC2
+    return MoECommType.ALLGATHER
 
 
 def _select_capacity_and_expert_density_moe_comm_method(
@@ -421,6 +571,11 @@ def select_moe_comm_method(
 
     mc2_tokens_capacity = get_mc2_tokens_capacity()
     moe_comm_policy = get_current_hardware_profile().moe_comm_policy
+    quant_type = getattr(
+        vllm_config.model_config.hf_text_config,
+        "moe_quantize",
+        getattr(vllm_config.model_config.hf_text_config, "quantize", None),
+    )
     lora_config = getattr(vllm_config, "lora_config", None)
     if not vllm_config.parallel_config.enable_expert_parallel or get_ep_group().world_size == 1:
         moe_comm_type = MoECommType.ALLGATHER
@@ -430,6 +585,14 @@ def select_moe_comm_method(
         # is a single fused C++ op. This covers both normal model
         # forward and _dummy_run during profile_run.
         moe_comm_type = MoECommType.ALLTOALL
+    elif _is_a2_megamoe_enabled(get_ascend_config()):
+        moe_comm_type = _select_a2_moe_comm_method(
+            num_tokens,
+            vllm_config,
+            mc2_tokens_capacity,
+            quant_type if not is_draft_model else draft_moe_quant_type,
+            is_draft_model,
+        )
     elif moe_comm_policy is MoECommPolicy.ALLGATHER:
         moe_comm_type = MoECommType.ALLGATHER
     else:

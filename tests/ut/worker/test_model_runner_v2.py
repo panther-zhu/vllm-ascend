@@ -16,7 +16,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu import model_runner as vllm_model_runner
 from vllm.v1.worker.gpu.model_runner import BatchReqState, GPUModelRunner
 
-from vllm_ascend.ascend_forward_context import MoECommType
+from vllm_ascend.ascend_forward_context import MoECommType, get_mrv2_num_actual_tokens
 from vllm_ascend.attention.attention_c8_mxfp import (
     AscendC8MXFPAttentionBackendImpl,
     fill_mxfp_v_scale_cache,
@@ -85,7 +85,9 @@ def _make_runner(need_timing: bool = True):
 )
 def test_metadata_and_dp_skip_scopes_coexist_and_retire(monkeypatch, dummy, profile, fail):
     runner = _make_runner(need_timing=False)
-    scheduler_output = SimpleNamespace(total_num_scheduled_tokens=0, num_scheduled_tokens={})
+    scheduler_output = SimpleNamespace(total_num_scheduled_tokens=5, num_scheduled_tokens={})
+    monkeypatch.setattr(runner, "_start_dump_data", Mock())
+    monkeypatch.setattr(runner, "_finalize_dump_data", Mock())
     active = set()
     events: list[str | tuple[str, bool]] = []
 
@@ -112,6 +114,7 @@ def test_metadata_and_dp_skip_scopes_coexist_and_retire(monkeypatch, dummy, prof
 
     def forward(_self, _output, **kwargs):
         assert active == {"dp_skip"}
+        assert get_mrv2_num_actual_tokens() == 5
         assert kwargs["dummy_run"] is dummy
         assert kwargs["is_profile"] is profile
         events.append("forward")
@@ -126,6 +129,7 @@ def test_metadata_and_dp_skip_scopes_coexist_and_retire(monkeypatch, dummy, prof
     else:
         assert runner.execute_model(scheduler_output, dummy_run=dummy, is_profile=profile) == "output"
     assert active == set()
+    assert get_mrv2_num_actual_tokens() is None
     runner.model_state.finish_execution.assert_called_once_with(failed=fail)
 
     expected = ["forward", ("finish", fail)]
@@ -379,6 +383,100 @@ def test_execute_model_skips_dp_coordination_when_safe():
     coordination_context.__enter__.assert_called_once_with()
     coordination_context.__exit__.assert_called_once()
     mock_execute_model.assert_called_once()
+
+
+@pytest.mark.parametrize("a2_megamoe_enabled", [False, True])
+def test_execute_model_bypasses_compiled_model_for_a2_megamoe(a2_megamoe_enabled):
+    runner = _make_runner(need_timing=False)
+    runner.get_model = MagicMock(return_value="model")
+    scheduler_output = SimpleNamespace(total_num_scheduled_tokens=1)
+    compile_context_active = False
+
+    @contextmanager
+    def compilation_context(_model):
+        nonlocal compile_context_active
+        compile_context_active = True
+        try:
+            yield
+        finally:
+            compile_context_active = False
+
+    def execute_model(_self, _scheduler_output, **_kwargs):
+        assert compile_context_active is a2_megamoe_enabled
+        return "output"
+
+    with (
+        patch.object(GPUModelRunner, "execute_model", execute_model),
+        patch(
+            "vllm_ascend.worker.v2.model_runner.should_skip_allreduce_across_dp_group",
+            return_value=False,
+        ),
+        patch("vllm_ascend.worker.v2.model_runner.has_kv_transfer_group", return_value=False),
+        patch(
+            "vllm_ascend.worker.v2.model_runner._is_a2_megamoe_enabled",
+            return_value=a2_megamoe_enabled,
+        ),
+        patch(
+            "vllm_ascend.worker.v2.model_runner.use_cann_megamoe",
+            return_value=a2_megamoe_enabled,
+        ),
+        patch(
+            "vllm_ascend.worker.v2.model_runner.disable_compilation",
+            side_effect=lambda model: compilation_context(model),
+        ) as disable_compilation,
+    ):
+        assert runner.execute_model(scheduler_output) == "output"
+
+    if a2_megamoe_enabled:
+        runner.get_model.assert_called_once_with()
+        disable_compilation.assert_called_once_with("model")
+    else:
+        runner.get_model.assert_not_called()
+        disable_compilation.assert_not_called()
+
+
+def test_empty_dp_dummy_forward_masks_all_tokens():
+    runner = _make_runner(need_timing=False)
+    actual_token_counts = []
+
+    def run_dummy(_num_tokens, *, is_idle_dp_dummy=False):
+        assert is_idle_dp_dummy
+        actual_token_counts.append(get_mrv2_num_actual_tokens())
+
+    runner._dummy_run = MagicMock(side_effect=run_dummy)
+
+    assert runner._run_empty_dp_dummy_forward() is None
+
+    runner._dummy_run.assert_called_once_with(1, is_idle_dp_dummy=True)
+    assert actual_token_counts == [0]
+    assert get_mrv2_num_actual_tokens() is None
+
+
+def test_execute_model_runs_dummy_for_empty_external_dp_rank():
+    runner = _make_runner(need_timing=False)
+    runner.parallel_config = SimpleNamespace(
+        distributed_executor_backend="external_launcher",
+        data_parallel_size=2,
+    )
+    scheduler_output = SimpleNamespace(total_num_scheduled_tokens=0)
+    actual_token_counts = []
+
+    def run_dummy(_num_tokens, *, is_idle_dp_dummy=False):
+        assert is_idle_dp_dummy
+        actual_token_counts.append(get_mrv2_num_actual_tokens())
+
+    runner._dummy_run = MagicMock(side_effect=run_dummy)
+    runner._maybe_send_draft_kv = Mock()
+
+    with (
+        patch.object(GPUModelRunner, "execute_model", return_value=None),
+        patch("vllm_ascend.worker.v2.model_runner.has_kv_transfer_group", return_value=False),
+        patch("vllm_ascend.worker.v2.model_runner.should_skip_allreduce_across_dp_group", return_value=False),
+    ):
+        runner.execute_model(scheduler_output)
+
+    runner._dummy_run.assert_called_once_with(1, is_idle_dp_dummy=True)
+    assert actual_token_counts == [0]
 
 
 def test_full_decode_only_keeps_graph_descriptor_request_count():

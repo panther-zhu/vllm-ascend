@@ -143,8 +143,16 @@ def gather_from_sequence_parallel_region(
 
 def load_cann_mega_moe_ops():
     ops_module = import_module("cann_ops_transformer.ops")
-    get_symm_buffer_for_mega_moe = ops_module.get_symm_buffer_for_mega_moe
-    mega_moe = ops_module.mega_moe
+    try:
+        get_symm_buffer_for_mega_moe = ops_module.get_symm_buffer_for_mega_moe
+        mega_moe = ops_module.mega_moe
+    except AttributeError:
+        # CANN 9.2.x keeps the implementation under mc2.mega_moe.  The
+        # top-level ops package in some installations does not re-export the
+        # helpers even though the implementation is available.
+        mega_moe_module = import_module("cann_ops_transformer.ops.mc2.mega_moe")
+        get_symm_buffer_for_mega_moe = mega_moe_module.get_symm_buffer_for_mega_moe
+        mega_moe = mega_moe_module.mega_moe
     # A5's communication extension is lazy-loaded by SymmBuffer. Compile it
     # during initialization, before TorchDynamo / ACL graph capture starts.
     try:
